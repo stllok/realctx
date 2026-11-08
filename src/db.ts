@@ -2,9 +2,29 @@ import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlit
 import { createRequire } from "node:module";
 import { hostname } from "node:os";
 import { randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ScopeKind } from "./files.ts";
+
+const require = createRequire(import.meta.url);
+
+// Bun on macOS links Apple's SQLite (SQLITE_OMIT_LOAD_EXTENSION); point it at a full build before first open.
+if (process.versions.bun && process.platform === "darwin") {
+	const candidates = [
+		process.env.HOMEBREW_PREFIX && `${process.env.HOMEBREW_PREFIX}/opt/sqlite/lib/libsqlite3.dylib`,
+		"/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib",
+		"/usr/local/opt/sqlite/lib/libsqlite3.dylib",
+		"/opt/local/lib/libsqlite3.dylib",
+	];
+	const lib = candidates.find((p): p is string => Boolean(p && existsSync(p)));
+	if (lib) {
+		try {
+			(require("bun:sqlite") as { Database: { setCustomSQLite(path: string): void } }).Database.setCustomSQLite(lib);
+		} catch {
+			// SQLite already loaded in this process; constructor falls back without allowExtension.
+		}
+	}
+}
 
 const SCHEMA_VERSION = 5;
 
@@ -198,22 +218,30 @@ export class RealctxDB {
 	constructor(path: string) {
 		this.path = path;
 		if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-		this.db = new DatabaseSync(path, { allowExtension: true, timeout: 15_000 });
+		let db: DatabaseSync;
 		let vecOk = false;
 		let vecErr: string | undefined;
 		try {
-			const require = createRequire(import.meta.url);
-			const sqliteVec = require("sqlite-vec") as { getLoadablePath(): string };
-			this.db.loadExtension(sqliteVec.getLoadablePath());
-			vecOk = true;
+			db = new DatabaseSync(path, { allowExtension: true, timeout: 15_000 });
+			try {
+				const sqliteVec = require("sqlite-vec") as { getLoadablePath(): string };
+				db.loadExtension(sqliteVec.getLoadablePath());
+				vecOk = true;
+			} catch (err) {
+				vecErr = err instanceof Error ? err.message : String(err);
+			}
+			try {
+				db.enableLoadExtension(false);
+			} catch {
+				// older node: ignore
+			}
 		} catch (err) {
+			const e = err as NodeJS.ErrnoException | undefined;
+			if (e?.code !== "ERR_LOAD_SQLITE_EXTENSION" && !e?.message?.includes("SQLITE_OMIT_LOAD_EXTENSION")) throw err;
 			vecErr = err instanceof Error ? err.message : String(err);
+			db = new DatabaseSync(path, { timeout: 15_000 });
 		}
-		try {
-			this.db.enableLoadExtension(false);
-		} catch {
-			// older node: ignore
-		}
+		this.db = db;
 		this.vecAvailable = vecOk;
 		this.vecError = vecErr;
 		this.db.exec("PRAGMA journal_mode = WAL");
@@ -519,11 +547,12 @@ export class RealctxDB {
 
 	/** Copy cached embeddings into the vector index for memories that are not indexed yet. */
 	syncVectors(fingerprint: string): number {
+		const needVecTable = this.vecAvailable && !this.vecDim() ? 1 : 0;
 		const rows = this.stmt(
 			`SELECT m.rid AS rid, m.store AS store, m.hash AS hash, e.vec AS vec FROM memories m
 			 JOIN embeddings e ON e.hash = m.hash AND e.fingerprint = ?
-			 WHERE m.vec_hash IS NULL OR m.vec_hash != m.hash`,
-		).all(fingerprint) as Array<{ rid: number; store: string; hash: string; vec: Uint8Array }>;
+			 WHERE ? = 1 OR m.vec_hash IS NULL OR m.vec_hash != m.hash`,
+		).all(fingerprint, needVecTable) as Array<{ rid: number; store: string; hash: string; vec: Uint8Array }>;
 		if (rows.length === 0) return 0;
 		this.tx(() => {
 			for (const r of rows) {

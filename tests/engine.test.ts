@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { normalizeSettings, saveSettings } from "../src/config.ts";
+import { RealctxDB } from "../src/db.ts";
 import { MemoryEngine } from "../src/engine.ts";
 import { clearProjectCache } from "../src/project.ts";
 
@@ -392,3 +393,53 @@ test("fresh install: no endpoints; the deterministic gate stores facts and reinf
 		rmSync(fresh, { recursive: true, force: true });
 	}
 });
+
+test("sqlite without extension support: opens cleanly, falls back to brute-force vectors, and indexes when sqlite-vec returns", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "realctx-noext-"));
+	const dbPath = join(dir, "realctx.sqlite");
+	try {
+		// Opening a DatabaseSync before importing db.ts locks Bun on macOS onto Apple's SQLite (SQLITE_OMIT_LOAD_EXTENSION).
+		const script = `
+			import { DatabaseSync } from "node:sqlite";
+			const pre = new DatabaseSync(":memory:");
+			const { RealctxDB } = await import(${JSON.stringify(new URL("../src/db.ts", import.meta.url).href)});
+			const db = new RealctxDB(process.argv[1]);
+			let rid = 0;
+			db.tx(() => {
+				rid = db.upsertMemoryLocked({ id: "m1", store: "s", kind: "shared", file: "/f", caption: "c", content: "x", paths: undefined, hash: "h1", created: undefined, updated: undefined, mtime: 1, size: 1, flags: undefined });
+				db.setFtsLocked(rid, "sqlite", "extension");
+			});
+			db.putEmbedding("h1", "fp", new Float32Array([1, 0, 0]));
+			db.syncVectors("fp");
+			const out = {
+				vecAvailable: db.vecAvailable,
+				fts: db.ftsSearch(["s"], "sqlite", 5).length,
+				vec: db.vecSearch(["s"], new Float32Array([1, 0, 0]), 5).length,
+			};
+			db.close();
+			pre.close();
+			console.log(JSON.stringify(out));
+		`;
+		const sub = await new Promise<{ vecAvailable: boolean; fts: number; vec: number }>((resolve, reject) => {
+			const p = spawn(process.execPath, ["--input-type=module", "-e", script, dbPath], { stdio: ["ignore", "pipe", "inherit"] });
+			let out = "";
+			p.stdout.on("data", (d) => (out += d));
+			p.on("exit", (code) => (code === 0 ? resolve(JSON.parse(out.trim().split("\n").pop()!)) : reject(new Error(`exit ${code}`))));
+		});
+		if (process.versions.bun && process.platform === "darwin") assert.equal(sub.vecAvailable, false);
+		assert.equal(sub.fts, 1);
+		assert.equal(sub.vec, 1);
+
+		const db = new RealctxDB(dbPath);
+		try {
+			db.syncVectors("fp");
+			if (db.vecAvailable) assert.equal(db.vecDim(), 3);
+			assert.equal(db.vecSearch(["s"], new Float32Array([1, 0, 0]), 5).length, 1);
+		} finally {
+			db.close();
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
